@@ -1,238 +1,199 @@
 import os
-from utils import dumpJsonFile, loadJsonFile
 import sqlite3
-import pandas as pd
-from text_sim import *
-from tqdm import tqdm
 import time
-
 import warnings
-warnings.filterwarnings('ignore')
 
-
+import pandas as pd
+from tqdm import tqdm
 from typing import List
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
+from utils import dumpJsonFile, loadJsonFile
+from text_sim import get_top_k_similar
 
-# Model taken from Huggingface Github Repo
-MODEL_PATH = "juierror/flan-t5-text2sql-with-schema"
-TOKENIZER_PATH = "juierror/flan-t5-text2sql-with-schema"
-COLUMNS_JSON_FILE = "/Users/niravdiwan/Desktop/projects/text2sql/text2sql-LLM/data/columns.json"
-
-def prepare_input(question: str, table: List[str]):
-    table_prefix = "table:"
-    table_name_prefix = "table_name:"
-    sample_prefix = ""
-    question_prefix = "question:"
-    join_table = ",".join(table)
-    inputs = f"""
-    You are an SQL Query expert who can write SQL queries for the below table.
-
-    {table_prefix} {join_table}
-
-    Answer the following question:
-    question : {question}
-    """
-    # print("\t ---- Prompt ----- \t")
-    # print(inputs)
-
-    input_ids = tokenizer(inputs, max_length=512, return_tensors="pt").input_ids
-    return input_ids
+warnings.filterwarnings('ignore')
 
 
-def cot_prepare_input(question: str, table: List[str], questions : List[str], example_queries : List[str]):
-    table_prefix = "table:"
-    table_name_prefix = "table_name:"
-    sample_prefix = ""
-    question_prefix = "question:"
-    join_table = ",".join(table)
-    inputs = f"""
-    You are an SQL Query expert who can write SQL queries for the below table.
-    {table_prefix} {join_table}
-    For the below questions, you are given the example queries. You need to write the SQL query for the last question.
-    """
-
-    for question_no, s_question in enumerate(questions):
-        inputs += f"""
-        {s_question}
-        {example_queries[question_no]}
-        """
-
-    inputs += f"""
-    Only answer the following question:
-    {question},
-    """
-
-    input_ids = tokenizer(inputs, max_length=512, return_tensors="pt").input_ids
-    return input_ids
+CHECKPOINT = "juierror/flan-t5-text2sql-with-schema"
+DEFAULT_TABLE = "employee"
+MAX_INPUT_LEN = 512
+MAX_OUTPUT_LEN = 1024
+BEAM_COUNT = 10
+TOP_K_BEAMS = 10
 
 
-def inference(question: str, table: List[str]) -> str:
-    input_data = prepare_input(question=question, table=table)
-    input_data = input_data.to(model.device)
-    outputs = model.generate(inputs=input_data, num_beams=10, top_k=10, max_length=1024)
-    result = tokenizer.decode(token_ids=outputs[0], skip_special_tokens=True)
-    return result
-
-def cot_inference(question: str, table: List[str], questions : List[str], example_queries : List[str]) -> str:
-    input_data = cot_prepare_input(question=question, table=table, questions = questions, example_queries = example_queries)
-    input_data = input_data.to(model.device)
-    outputs = model.generate(inputs=input_data, num_beams=10, top_k=10, max_length=1024)
-    result = tokenizer.decode(token_ids=outputs[0], skip_special_tokens=True)
-    return result
+def get_data_path(relative_path: str) -> str:
+    root = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(root, "..", "data", relative_path)
 
 
+def build_prompt(user_query: str, schema_fields: List[str]) -> object:
+    schema_str = ", ".join(schema_fields)
+    prompt = (
+        "You are a database expert. Given the schema below, write a valid SQL query.\n\n"
+        f"Schema: {schema_str}\n\n"
+        f"Task: {user_query}\n"
+    )
+    token_ids = tokenizer(prompt, max_length=MAX_INPUT_LEN,
+                          return_tensors="pt").input_ids
+    return token_ids
 
-def test(question, DB_FILEPATH = "../data/database/final_db.db", k = 5, table_name = "employee"):
 
-    # Retrive the samples
-    test_df = pd.read_csv("../data/example_queries/test_set/final_" +  table_name  + ".csv", delimiter="|")
-    retr_df = pd.read_csv("../data/example_queries/retr_set/final_" +  table_name  + ".csv", delimiter="|")
+def build_cot_prompt(
+    user_query: str,
+    schema_fields: List[str],
+    ref_questions: List[str],
+    ref_queries: List[str]
+) -> object:
+    schema_str = ", ".join(schema_fields)
+    prompt = (
+        "You are a database expert. Given the schema and reference examples below, "
+        "write a SQL query for the final task only.\n\n"
+        f"Schema: {schema_str}\n\n"
+        "Reference Examples:\n"
+    )
+    for idx, q in enumerate(ref_questions):
+        prompt += f"Q: {q}\nSQL: {ref_queries[idx]}\n\n"
 
-    sample_questions = []
-    sample_queries = []
+    prompt += f"Now answer only this:\nQ: {user_query}\nSQL:"
 
-    print("\n")
+    token_ids = tokenizer(prompt, max_length=MAX_INPUT_LEN,
+                          return_tensors="pt").input_ids
+    return token_ids
 
-    for index, row in retr_df.iterrows():
-        s_question = row["Question"]
-        sql_query = row["SQL Query"]
-        sample_questions.append(s_question)
-        sample_queries.append(sql_query)
 
-    print("Loading SQL Database ...")
-    conn = sqlite3.connect(DB_FILEPATH)
-    for i in tqdm(range(2)):
+def run_model(token_ids) -> str:
+    token_ids = token_ids.to(model.device)
+    output_ids = model.generate(
+        inputs=token_ids,
+        num_beams=BEAM_COUNT,
+        top_k=TOP_K_BEAMS,
+        max_length=MAX_OUTPUT_LEN
+    )
+    return tokenizer.decode(token_ids=output_ids[0], skip_special_tokens=True)
+
+
+def fix_table_reference(query: str, tbl: str) -> str:
+    return query.replace(" table", f" {tbl}")
+
+
+def fetch_similar_examples(user_query: str, ref_questions: List[str], ref_queries: List[str], k: int):
+    ranked_indices = get_top_k_similar(user_query, ref_questions, k=k)
+    matched_q = [ref_questions[i] for i in ranked_indices]
+    matched_sql = [ref_queries[i] for i in ranked_indices]
+    return matched_q, matched_sql
+
+
+def execute_query(conn: sqlite3.Connection, sql: str):
+    try:
+        rows = conn.execute(sql).fetchall()
+        print("Result:", rows)
+        return True
+    except Exception as e:
+        print(f"Execution failed: {e}")
+        return False
+
+
+def load_reference_data(tbl: str):
+    retr_path = get_data_path(f"example_queries/retr_set/final_{tbl}.csv")
+    retr_df = pd.read_csv(retr_path, delimiter="|")
+    questions = retr_df["Question"].tolist()
+    queries = retr_df["SQL Query"].tolist()
+    return questions, queries
+
+
+def run_single(user_query: str, db_path: str, tbl: str = DEFAULT_TABLE, k: int = 5):
+    ref_questions, ref_queries = load_reference_data(tbl)
+
+    print(f"\nConnecting to database at: {db_path}")
+    conn = sqlite3.connect(db_path)
+    for _ in tqdm(range(2)):
         time.sleep(1)
 
+    print(
+        f"\nFinding top-{k} similar examples for chain-of-thought context...")
+    sim_questions, sim_queries = fetch_similar_examples(
+        user_query, ref_questions, ref_queries, k)
 
-    print("\n")
+    for i, sq in enumerate(sim_questions):
+        print(f"  [{i+1}] Q: {sq}")
+        print(f"       SQL: {sim_queries[i]}")
 
-    print("Retrieving top " + str(k)  + " similar queries from the dataset to perform Chain of Thought (CoT) Prompting ...")
-    top_k_indices = get_top_k_similar(question, sample_questions, k = k)
+    print("\n--- Zero-Shot Generation ---")
+    zs_sql = fix_table_reference(
+        run_model(build_prompt(user_query, schema)), tbl)
+    print("Query:", zs_sql)
+    success = execute_query(conn, zs_sql)
+    print("Status:", "OK" if success else "FAILED")
 
-    sample_questions = [sample_questions[i] for i in top_k_indices]
-    sample_queries = [sample_queries[i] for i in top_k_indices]
-
-    for question_no, s_question in enumerate(sample_questions):
-        print("Question : ", sample_questions[question_no])
-        print("SQL Query :", sample_queries[question_no])
-
-    print("\n")
-
-    # print(" ========= Zero-Shot Test SQL ========= ")
-    gen_query1 = inference(question, table)
-    gen_query1 = gen_query1.replace(" table", " " + table_name)
-    
-    print("Generated Query using Zero-Shot Prompting = ", gen_query1)
-    try:
-        print(conn.execute(gen_query1).fetchall())
-        print("Zero-Shot Query Works!")
-    except:
-        print("Error in Zero-Shot SQL Query")
-
-    # print(" ========= CoT Test SQL ========= ")
-    gen_query2 = cot_inference(question, table, sample_questions, sample_queries)
-    gen_query2 = gen_query2.replace(" table", " " + table_name)
-    
-    print("Generated Query using Chain of Thought (CoT) Prompting = ", gen_query2)
-    try:
-        print(conn.execute(gen_query2).fetchall())
-        print("CoT Query Works!")
-    except:
-        print("Error in CoT SQL Query!")
-
-
-
-def test_dataset(DB_FILEPATH = "../data/database/final_db.db", k = 5, table_name = "employee"):
-
-    test_df = pd.read_csv(get_data_path("example_queries/test_set/final_" + table_name + ".csv"), delimiter="|")
-    retr_df = pd.read_csv(get_data_path("example_queries/retr_set/final_" + table_name + ".csv"), delimiter="|")
-
-    sample_questions = []
-    sample_queries = []
-
-
-    print("\n")
-
-    for index, row in retr_df.iterrows():
-        s_question = row["Question"]
-        sql_query = row["SQL Query"]
-        sample_questions.append(s_question)
-        sample_queries.append(sql_query)
-
-    print("Loading SQL Database ...")
-    conn = sqlite3.connect(DB_FILEPATH)
-    for i in tqdm(range(2)):
-        time.sleep(1)
-
-    for index, row in test_df.iterrows():
-        print("\n\n\n\n\n")
-        print(" ========= Test Query ========= ")
-        question = row["Question"]
-
-        top_k_indices = get_top_k_similar(question, sample_questions, k=5)
-
-        print("Loading Sample ")
-
-        sample_questions = [sample_questions[i] for i in top_k_indices]
-        sample_queries = [sample_queries[i] for i in top_k_indices]
-
-        print("Sample Questions = ", sample_questions)
-        print("Sample Queries = ", sample_queries)
-
-        print(" ========= Zero-Shot Test SQL ========= ")
-        sql_query = row["SQL Query"]
-        gen_query = inference(question, table)
-        gen_query = gen_query.replace(" table", " " + table_name)
-        print("Generated Query = ", gen_query)
-        print("Original Query = ", sql_query)
-        try:
-            print(conn.execute(gen_query).fetchall())
-        except:
-            print("Error in SQL Query")
-
-
-        print("\n\n\n\n\n")
-
-        print(" ========= CoT Test SQL ========= ")
-        gen_query = cot_inference(question, table, sample_questions, sample_queries)
-        gen_query = gen_query.replace(" table", " " + table_name)
-        print("Generated Query = ", gen_query)
-        print("Original Query = ", sql_query)
-        try:
-            print(conn.execute(gen_query).fetchall())
-        except:
-            print("Error in SQL Query")
+    print("\n--- Chain-of-Thought Generation ---")
+    cot_sql = fix_table_reference(
+        run_model(build_cot_prompt(user_query, schema,
+                  sim_questions, sim_queries)), tbl
+    )
+    print("Query:", cot_sql)
+    success = execute_query(conn, cot_sql)
+    print("Status:", "OK" if success else "FAILED")
 
     conn.close()
 
 
+def run_evaluation(db_path: str, tbl: str = DEFAULT_TABLE, k: int = 5):
+    test_path = get_data_path(f"example_queries/test_set/final_{tbl}.csv")
+    test_df = pd.read_csv(test_path, delimiter="|")
+    ref_questions, ref_queries = load_reference_data(tbl)
 
-print("\n\n\n")
-print("Hi! I am a SQL Query Generator. I can generate SQL queries for you. Please enter the table name for which you want to generate the SQL query.")
-table_name = input("Enter the table name : ")
+    print(f"\nConnecting to database...")
+    conn = sqlite3.connect(db_path)
+    for _ in tqdm(range(2)):
+        time.sleep(1)
 
-def get_data_path(filename):
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(base_dir, "..", "data", filename)
+    for _, row in test_df.iterrows():
+        q = row["Question"]
+        ground_truth = row["SQL Query"]
+        print(f"\n{'='*50}")
+        print(f"Question : {q}")
+        print(f"Expected : {ground_truth}")
 
-columns = loadJsonFile(get_data_path("columns.json"), verbose=False)
-# columns = loadJsonFile("../data/columns.json", verbose=False)
-table = columns[table_name]
+        sim_questions, sim_queries = fetch_similar_examples(
+            q, ref_questions, ref_queries, k)
 
-print("\n")
+        print("\n[Zero-Shot]")
+        zs_sql = fix_table_reference(run_model(build_prompt(q, schema)), tbl)
+        print("Generated:", zs_sql)
+        execute_query(conn, zs_sql)
 
-print("Loading the model ...")
-tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
-model = AutoModelForSeq2SeqLM.from_pretrained(TOKENIZER_PATH)
+        print("\n[Chain-of-Thought]")
+        cot_sql = fix_table_reference(
+            run_model(build_cot_prompt(
+                q, schema, sim_questions, sim_queries)), tbl
+        )
+        print("Generated:", cot_sql)
+        execute_query(conn, cot_sql)
 
-test_bool = input("Do you want to enter your own question (y) or perform an evaluation on the test dataset (n) ?")
+    conn.close()
 
-print("\n")
 
-if test_bool == "y":
-    question = input("Enter your question : ")
-    test(question, DB_FILEPATH = get_data_path("database/final_db.db"), k = 5, table_name = table_name)
+# ── Entry Point ──────────────────────────────────────────────────────────────
+
+print("\nSQL Query Assistant")
+print("-------------------")
+tbl_name = input("Enter target table name: ").strip()
+
+column_data = loadJsonFile(get_data_path("columns.json"), verbose=False)
+schema = column_data[tbl_name]
+
+print("\nLoading language model, please wait...")
+tokenizer = AutoTokenizer.from_pretrained(CHECKPOINT)
+model = AutoModelForSeq2SeqLM.from_pretrained(CHECKPOINT)
+
+mode = input(
+    "\nEnter your own question (y) or run full evaluation (n)? ").strip().lower()
+
+db_file = get_data_path("database/final_db.db")
+
+if mode == "y":
+    user_q = input("Enter your question: ").strip()
+    run_single(user_q, db_path=db_file, tbl=tbl_name)
 else:
-    test_dataset(DB_FILEPATH = get_data_path("database/final_db.db"), k = 5, table_name = table_name)
+    run_evaluation(db_path=db_file, tbl=tbl_name)
