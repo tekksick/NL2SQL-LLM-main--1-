@@ -146,8 +146,8 @@ def test(question, DB_FILEPATH = "../data/database/final_db.db", k = 5, table_na
 
 def test_dataset(DB_FILEPATH = "../data/database/final_db.db", k = 5, table_name = "employee"):
 
-    test_df = pd.read_csv("../data/example_queries/test_set/final_" +  table_name  + ".csv", delimiter="|")
-    retr_df = pd.read_csv("../data/example_queries/retr_set/final_" +  table_name  + ".csv", delimiter="|")
+    test_df = pd.read_csv(get_data_path("example_queries/test_set/final_" + table_name + ".csv"), delimiter="|")
+    retr_df = pd.read_csv(get_data_path("example_queries/retr_set/final_" + table_name + ".csv"), delimiter="|")
 
     sample_questions = []
     sample_queries = []
@@ -213,7 +213,12 @@ print("\n\n\n")
 print("Hi! I am a SQL Query Generator. I can generate SQL queries for you. Please enter the table name for which you want to generate the SQL query.")
 table_name = input("Enter the table name : ")
 
-columns = loadJsonFile("../data/columns.json", verbose=False)
+def get_data_path(filename):
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_dir, "..", "data", filename)
+
+columns = loadJsonFile(get_data_path("columns.json"), verbose=False)
+# columns = loadJsonFile("../data/columns.json", verbose=False)
 table = columns[table_name]
 
 print("\n")
@@ -228,6 +233,6 @@ print("\n")
 
 if test_bool == "y":
     question = input("Enter your question : ")
-    test(question, DB_FILEPATH = "../data/database/final_db.db", k = 5, table_name = table_name)
+    test(question, DB_FILEPATH = get_data_path("database/final_db.db"), k = 5, table_name = table_name)
 else:
-    test_dataset(DB_FILEPATH = "../data/database/final_db.db", k = 5, table_name = table_name)
+    test_dataset(DB_FILEPATH = get_data_path("database/final_db.db"), k = 5, table_name = table_name)
